@@ -2,6 +2,7 @@ import time
 import os
 
 from .utils import FunctionSpec, OutputType, opt_messages_to_list, backoff_create
+from ai_scientist.utils.network import normalize_httpx_proxy_env
 from funcy import notnone, once, select_values
 import anthropic
 
@@ -15,6 +16,7 @@ ANTHROPIC_TIMEOUT_EXCEPTIONS = (
 )
 
 def get_ai_client(model : str, max_retries=2) -> anthropic.AnthropicBedrock:
+    normalize_httpx_proxy_env()
     client = anthropic.AnthropicBedrock(max_retries=max_retries)
     return client
 

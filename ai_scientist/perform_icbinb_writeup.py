@@ -355,7 +355,7 @@ Reasons to reference papers include:
 8. Suggesting Future Research: Reference studies related to proposed future research directions.
 
 Ensure sufficient cites will be collected for all of these categories, and no categories are missed.
-You will be given access to the Semantic Scholar API; only add citations that you have found using the API.
+You will be given access to a Semantic Scholar search tool; only add citations that you have found using that tool.
 Aim to discuss a broad range of relevant papers, not just the most popular ones.
 Make sure not to copy verbatim from prior literature to avoid plagiarism.
 You will have {total_rounds} rounds to add to the references but do not need to use them all.
@@ -459,11 +459,14 @@ This JSON will be automatically parsed, so ensure the format is precise."""
 
     paper_strings = []
     for i, paper in enumerate(papers):
+        authors = ", ".join(
+            author.get("name", "Unknown") for author in paper.get("authors", [])
+        )
         paper_strings.append(
             "{i}: {title}. {authors}. {venue}, {year}.\nAbstract: {abstract}".format(
                 i=i,
                 title=paper["title"],
-                authors=paper["authors"],
+                authors=authors,
                 venue=paper["venue"],
                 year=paper["year"],
                 abstract=paper["abstract"],
@@ -677,15 +680,33 @@ def load_exp_summaries(base_folder):
         if osp.exists(path):
             try:
                 with open(path, "r") as f:
-                    loaded_summaries[key] = json.load(f)
+                    loaded_summaries[key] = _normalize_loaded_summary(
+                        json.load(f), stage_name=key
+                    )
             except json.JSONDecodeError:
                 print(
                     f"Warning: {fname} is not valid JSON. Using empty data for {key}."
                 )
-                loaded_summaries[key] = {}
+                loaded_summaries[key] = _empty_summary_for_stage(key)
         else:
-            loaded_summaries[key] = {}
+            loaded_summaries[key] = _empty_summary_for_stage(key)
     return loaded_summaries
+
+
+def _empty_summary_for_stage(stage_name):
+    if stage_name == "ABLATION_SUMMARY":
+        return []
+    return {}
+
+
+def _normalize_loaded_summary(summary, stage_name):
+    if summary is None:
+        return _empty_summary_for_stage(stage_name)
+    if stage_name == "ABLATION_SUMMARY":
+        return summary if isinstance(summary, list) else []
+    if stage_name in {"BASELINE_SUMMARY", "RESEARCH_SUMMARY"}:
+        return summary if isinstance(summary, dict) else {}
+    return summary
 
 
 def filter_experiment_summaries(exp_summaries, step_name):
@@ -720,25 +741,36 @@ def filter_experiment_summaries(exp_summaries, step_name):
 
     filtered_summaries = {}
     for stage_name in exp_summaries.keys():
+        stage_summary = _normalize_loaded_summary(
+            exp_summaries.get(stage_name), stage_name
+        )
         if stage_name in {"BASELINE_SUMMARY", "RESEARCH_SUMMARY"}:
             filtered_summaries[stage_name] = {}
-            for key in exp_summaries[stage_name].keys():
+            for key in stage_summary.keys():
                 if key in {"best node"}:
+                    best_node_summary = stage_summary.get(key)
+                    if not isinstance(best_node_summary, dict):
+                        continue
                     filtered_summaries[stage_name][key] = {}
-                    for node_key in exp_summaries[stage_name][key].keys():
+                    for node_key in best_node_summary.keys():
                         if node_key in node_keys_to_keep:
                             filtered_summaries[stage_name][key][node_key] = (
-                                exp_summaries[stage_name][key][node_key]
+                                best_node_summary[node_key]
                             )
-        elif stage_name == "ABLATION_SUMMARY" and step_name == "plot_aggregation":
+        elif stage_name == "ABLATION_SUMMARY":
             filtered_summaries[stage_name] = {}
-            for ablation_summary in exp_summaries[stage_name]:
-                filtered_summaries[stage_name][ablation_summary["ablation_name"]] = {}
+            for ablation_summary in stage_summary:
+                if not isinstance(ablation_summary, dict):
+                    continue
+                ablation_name = ablation_summary.get("ablation_name")
+                if not ablation_name:
+                    continue
+                filtered_summaries[stage_name][ablation_name] = {}
                 for node_key in ablation_summary.keys():
                     if node_key in node_keys_to_keep:
-                        filtered_summaries[stage_name][
-                            ablation_summary["ablation_name"]
-                        ][node_key] = ablation_summary[node_key]
+                        filtered_summaries[stage_name][ablation_name][node_key] = (
+                            ablation_summary[node_key]
+                        )
     return filtered_summaries
 
 

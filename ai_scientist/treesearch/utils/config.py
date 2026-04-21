@@ -14,6 +14,7 @@ import logging
 
 from . import tree_export
 from . import copytree, preproc_data, serialize
+from ..journal import candidate_strategy_for_stage_name
 
 shutup.mute_warnings()
 logging.basicConfig(
@@ -236,13 +237,17 @@ def save_run(cfg: Config, journal, stage_name: str = None):
         raise
     # create the tree + code visualization
     try:
-        tree_export.generate(cfg, journal, save_dir / "tree_plot.html")
+        tree_export.generate(
+            cfg, journal, save_dir / "tree_plot.html", stage_name=stage_name
+        )
     except Exception as e:
         print(f"Error generating tree: {e}")
         raise
     # save the best found solution
     try:
-        best_node = journal.get_best_node(only_good=False, cfg=cfg)
+        best_node = journal.get_best_node(
+            cfg=cfg, candidate_strategy=candidate_strategy_for_stage_name(stage_name)
+        )
         if best_node is not None:
             for existing_file in save_dir.glob("best_solution_*.py"):
                 existing_file.unlink()

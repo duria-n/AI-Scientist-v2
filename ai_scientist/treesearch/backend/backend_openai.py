@@ -1,8 +1,10 @@
 import json
 import logging
+import os
 import time
 
 from .utils import FunctionSpec, OutputType, opt_messages_to_list, backoff_create
+from ai_scientist.utils.network import normalize_httpx_proxy_env
 from funcy import notnone, once, select_values
 import openai
 from rich import print
@@ -17,11 +19,32 @@ OPENAI_TIMEOUT_EXCEPTIONS = (
     openai.InternalServerError,
 )
 
+
+DEEPSEEK_MODEL_ALIASES = {
+    "deepseek-coder-v2-0724": "deepseek-coder",
+}
+
+
+def _is_deepseek_model(model: str) -> bool:
+    return model.startswith("deepseek-") or model in DEEPSEEK_MODEL_ALIASES
+
+
+def _resolve_deepseek_model(model: str) -> str:
+    return DEEPSEEK_MODEL_ALIASES.get(model, model)
+
+
 def get_ai_client(model: str, max_retries=2) -> openai.OpenAI:
+    normalize_httpx_proxy_env()
     if model.startswith("ollama/"):
         client = openai.OpenAI(
             base_url="http://localhost:11434/v1", 
             max_retries=max_retries
+        )
+    elif _is_deepseek_model(model):
+        client = openai.OpenAI(
+            api_key=os.environ["DEEPSEEK_API_KEY"],
+            base_url="https://api.deepseek.com",
+            max_retries=max_retries,
         )
     else:
         client = openai.OpenAI(max_retries=max_retries)
@@ -46,6 +69,8 @@ def query(
 
     if filtered_kwargs.get("model", "").startswith("ollama/"):
        filtered_kwargs["model"] = filtered_kwargs["model"].replace("ollama/", "")
+    elif _is_deepseek_model(filtered_kwargs.get("model", "")):
+        filtered_kwargs["model"] = _resolve_deepseek_model(filtered_kwargs["model"])
 
     t0 = time.time()
     completion = backoff_create(

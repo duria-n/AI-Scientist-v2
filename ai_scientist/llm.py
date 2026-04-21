@@ -2,6 +2,7 @@ import json
 import os
 import re
 from typing import Any
+from ai_scientist.utils.network import normalize_httpx_proxy_env
 from ai_scientist.utils.token_tracker import track_token_usage
 
 import anthropic
@@ -9,6 +10,17 @@ import backoff
 import openai
 
 MAX_NUM_TOKENS = 4096
+DEEPSEEK_MODEL_ALIASES = {
+    "deepseek-coder-v2-0724": "deepseek-coder",
+}
+
+
+def _is_deepseek_model(model: str) -> bool:
+    return model.startswith("deepseek-") or model in DEEPSEEK_MODEL_ALIASES
+
+
+def _resolve_deepseek_model(model: str) -> str:
+    return DEEPSEEK_MODEL_ALIASES.get(model, model)
 
 AVAILABLE_LLMS = [
     "claude-3-5-sonnet-20240620",
@@ -31,6 +43,9 @@ AVAILABLE_LLMS = [
     "o3-mini",
     "o3-mini-2025-01-31",
     # DeepSeek Models
+    "deepseek-chat",
+    "deepseek-reasoner",
+    "deepseek-coder",
     "deepseek-coder-v2-0724",
     "deepcoder-14b",
     # Llama 3 models
@@ -133,10 +148,10 @@ def get_batch_responses_from_llm(
         new_msg_history = [
             new_msg_history + [{"role": "assistant", "content": c}] for c in content
         ]
-    elif model == "deepseek-coder-v2-0724":
+    elif _is_deepseek_model(model):
         new_msg_history = msg_history + [{"role": "user", "content": msg}]
         response = client.chat.completions.create(
-            model="deepseek-coder",
+            model=_resolve_deepseek_model(model),
             messages=[
                 {"role": "system", "content": system_message},
                 *new_msg_history,
@@ -238,6 +253,18 @@ def make_llm_call(client, model, temperature, system_message, prompt):
             n=1,
             stop=None,
             seed=0,
+        )
+    elif _is_deepseek_model(model):
+        return client.chat.completions.create(
+            model=_resolve_deepseek_model(model),
+            messages=[
+                {"role": "system", "content": system_message},
+                *prompt,
+            ],
+            temperature=temperature,
+            max_tokens=MAX_NUM_TOKENS,
+            n=1,
+            stop=None,
         )
     elif "o1" in model or "o3" in model:
         return client.chat.completions.create(
@@ -346,18 +373,14 @@ def get_response_from_llm(
         )
         content = response.choices[0].message.content
         new_msg_history = new_msg_history + [{"role": "assistant", "content": content}]
-    elif model == "deepseek-coder-v2-0724":
+    elif _is_deepseek_model(model):
         new_msg_history = msg_history + [{"role": "user", "content": msg}]
-        response = client.chat.completions.create(
-            model="deepseek-coder",
-            messages=[
-                {"role": "system", "content": system_message},
-                *new_msg_history,
-            ],
-            temperature=temperature,
-            max_tokens=MAX_NUM_TOKENS,
-            n=1,
-            stop=None,
+        response = make_llm_call(
+            client,
+            model,
+            temperature,
+            system_message=system_message,
+            prompt=new_msg_history,
         )
         content = response.choices[0].message.content
         new_msg_history = new_msg_history + [{"role": "assistant", "content": content}]
@@ -478,6 +501,7 @@ def extract_json_between_markers(llm_output: str) -> dict | None:
 
 
 def create_client(model) -> tuple[Any, str]:
+    normalize_httpx_proxy_env()
     if model.startswith("claude-"):
         print(f"Using Anthropic API with model {model}.")
         return anthropic.Anthropic(), model
@@ -501,14 +525,15 @@ def create_client(model) -> tuple[Any, str]:
     elif "o1" in model or "o3" in model:
         print(f"Using OpenAI API with model {model}.")
         return openai.OpenAI(), model
-    elif model == "deepseek-coder-v2-0724":
-        print(f"Using OpenAI API with {model}.")
+    elif _is_deepseek_model(model):
+        resolved_model = _resolve_deepseek_model(model)
+        print(f"Using DeepSeek API with model {resolved_model}.")
         return (
             openai.OpenAI(
                 api_key=os.environ["DEEPSEEK_API_KEY"],
                 base_url="https://api.deepseek.com",
             ),
-            model,
+            resolved_model,
         )
     elif model == "deepcoder-14b":
         print(f"Using HuggingFace API with {model}.")

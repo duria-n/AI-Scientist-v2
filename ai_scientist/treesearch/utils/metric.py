@@ -1,9 +1,114 @@
+import math
+import re
 from dataclasses import dataclass, field
 from functools import total_ordering
 from typing import Any
 
 import numpy as np
 from dataclasses_json import DataClassJsonMixin
+
+PERCENT_METRIC_TOKENS = (
+    "score",
+    "accuracy",
+    "precision",
+    "recall",
+    "f1",
+    "traceability",
+)
+UNIT_INTERVAL_METRIC_TOKENS = ("probability", "rate")
+NON_NEGATIVE_METRIC_TOKENS = ("loss", "error", "mae", "rmse")
+
+
+def _is_finite_number(value: Any) -> bool:
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _matches_metric_token(metric_text: str, token: str) -> bool:
+    return re.search(rf"\b{re.escape(token)}\b", metric_text) is not None
+
+
+def validate_metric_value(metric_value: "MetricValue") -> list[str]:
+    """Return deterministic validation errors for parsed metric values."""
+    if metric_value.value is None:
+        return ["Metric value is missing."]
+
+    if not isinstance(metric_value.value, dict):
+        if not _is_finite_number(metric_value.value):
+            return [f"Metric value must be finite, got {metric_value.value!r}."]
+        return []
+
+    metric_payload = metric_value.value
+    if "metric_names" not in metric_payload:
+        legacy_values = metric_payload.values()
+        invalid_values = [value for value in legacy_values if value is not None and not _is_finite_number(value)]
+        if invalid_values:
+            return [f"Legacy metric payload contains non-finite values: {invalid_values!r}."]
+        return []
+
+    metrics = metric_payload.get("metric_names")
+    if not isinstance(metrics, list) or not metrics:
+        return ["Metric payload must contain a non-empty 'metric_names' list."]
+
+    errors: list[str] = []
+    for metric in metrics:
+        metric_name = str(metric.get("metric_name", "")).strip()
+        metric_description = str(metric.get("description", "")).strip()
+        metric_label = metric_name or "<unnamed metric>"
+        metric_text = f"{metric_name} {metric_description}".lower()
+        metric_data = metric.get("data")
+
+        if not isinstance(metric_data, list) or not metric_data:
+            errors.append(f"{metric_label}: metric data is empty.")
+            continue
+
+        expects_percent = "%" in metric_text or any(
+            _matches_metric_token(metric_text, token) for token in PERCENT_METRIC_TOKENS
+        )
+        expects_unit_interval = (
+            not expects_percent
+            and any(
+                _matches_metric_token(metric_text, token)
+                for token in UNIT_INTERVAL_METRIC_TOKENS
+            )
+        )
+        expects_non_negative = any(
+            _matches_metric_token(metric_text, token)
+            for token in NON_NEGATIVE_METRIC_TOKENS
+        )
+
+        for data_point in metric_data:
+            dataset_name = str(data_point.get("dataset_name", "<unknown dataset>"))
+            for field_name in ("final_value", "best_value"):
+                value = data_point.get(field_name)
+                if value is None:
+                    errors.append(
+                        f"{metric_label} on {dataset_name}: {field_name} is missing."
+                    )
+                    continue
+                if not _is_finite_number(value):
+                    errors.append(
+                        f"{metric_label} on {dataset_name}: {field_name} must be finite, got {value!r}."
+                    )
+                    continue
+
+                numeric_value = float(value)
+                if expects_non_negative and numeric_value < 0:
+                    errors.append(
+                        f"{metric_label} on {dataset_name}: {field_name} must be >= 0, got {numeric_value:.6g}."
+                    )
+                if expects_percent and not (0.0 <= numeric_value <= 100.0):
+                    errors.append(
+                        f"{metric_label} on {dataset_name}: {field_name} must be in [0, 100], got {numeric_value:.6g}."
+                    )
+                if expects_unit_interval and not (0.0 <= numeric_value <= 1.0):
+                    errors.append(
+                        f"{metric_label} on {dataset_name}: {field_name} must be in [0, 1], got {numeric_value:.6g}."
+                    )
+
+    return errors
 
 
 @dataclass

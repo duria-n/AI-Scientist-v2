@@ -1,4 +1,5 @@
 from __future__ import annotations
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -20,6 +21,9 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_TREESEARCH_TEXT_MODEL = "deepseek-chat"
+DEFAULT_TREESEARCH_TEXT_TEMP = 0.3
+
 node_selection_spec = FunctionSpec(
     name="select_best_implementation",
     description="Select the best implementation based on comprehensive analysis",
@@ -38,6 +42,27 @@ node_selection_spec = FunctionSpec(
         "required": ["selected_id", "reasoning"],
     },
 )
+
+CandidateStrategy = Literal["all", "runnable", "good", "plot_validated"]
+
+
+def stage_number_from_stage_name(stage_name: str | None) -> int | None:
+    if stage_name is None:
+        return None
+    match = re.search(r"(?:^|stage_)(\d+)", str(stage_name))
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def candidate_strategy_for_stage_number(stage_number: int | None) -> CandidateStrategy:
+    if stage_number in {2, 3, 4}:
+        return "plot_validated"
+    return "good"
+
+
+def candidate_strategy_for_stage_name(stage_name: str | None) -> CandidateStrategy:
+    return candidate_strategy_for_stage_number(stage_number_from_stage_name(stage_name))
 
 
 @dataclass(eq=False)
@@ -387,8 +412,13 @@ class Journal:
         return [n for n in self.nodes if n.is_buggy]
 
     @property
+    def runnable_nodes(self) -> list[Node]:
+        """Return nodes with successful execution and valid metrics, regardless of plot review."""
+        return [n for n in self.nodes if n.is_buggy is False]
+
+    @property
     def good_nodes(self) -> list[Node]:
-        """Return a list of nodes that are not considered buggy by the agent."""
+        """Return nodes that are runnable and not explicitly rejected by plot review."""
         list_of_nodes = [
             [
                 n.step,
@@ -402,9 +432,29 @@ class Journal:
         print(
             f"[purple]all nodes ID and is_buggy/is_buggy_plots flags: {list_of_nodes}[/purple]"
         )
+        return [n for n in self.nodes if n.is_buggy is False and n.is_buggy_plots is not True]
+
+    @property
+    def plot_validated_good_nodes(self) -> list[Node]:
+        """Return nodes that are runnable and explicitly validated by plot review."""
         return [
-            n for n in self.nodes if n.is_buggy is False and n.is_buggy_plots is False
+            n
+            for n in self.nodes
+            if n.is_buggy is False and n.is_buggy_plots is False
         ]
+
+    def nodes_for_candidate_strategy(
+        self, candidate_strategy: CandidateStrategy = "good"
+    ) -> list[Node]:
+        if candidate_strategy == "all":
+            return self.nodes
+        if candidate_strategy == "runnable":
+            return self.runnable_nodes
+        if candidate_strategy == "plot_validated":
+            return self.plot_validated_good_nodes
+        if candidate_strategy == "good":
+            return self.good_nodes
+        raise ValueError(f"Unknown candidate strategy: {candidate_strategy}")
 
     def get_node_by_id(self, node_id: str) -> Optional[Node]:
         """Get a node by its ID."""
@@ -417,14 +467,20 @@ class Journal:
         """Return a list of all metric values in the journal."""
         return [n.metric for n in self.nodes]
 
-    def get_best_node(self, only_good=True, use_val_metric_only=False, cfg=None) -> None | Node:
+    def get_best_node(
+        self,
+        only_good: bool | None = None,
+        use_val_metric_only: bool = False,
+        cfg=None,
+        candidate_strategy: CandidateStrategy | None = None,
+    ) -> None | Node:
         """Return the best solution found so far."""
-        if only_good:
-            nodes = self.good_nodes
-            if not nodes:
-                return None
-        else:
-            nodes = self.nodes
+        if candidate_strategy is None:
+            candidate_strategy = "all" if only_good is False else "good"
+
+        nodes = self.nodes_for_candidate_strategy(candidate_strategy)
+        if not nodes:
+            return None
 
         if use_val_metric_only:
             return max(nodes, key=lambda n: n.metric)
@@ -468,8 +524,8 @@ class Journal:
 
         try:
             if cfg is None or cfg.agent.get("select_node", None) is None:
-                model = "gpt-4o"
-                temperature = 0.3
+                model = DEFAULT_TREESEARCH_TEXT_MODEL
+                temperature = DEFAULT_TREESEARCH_TEXT_TEMP
             else:
                 model = cfg.agent.select_node.model
                 temperature = cfg.agent.select_node.temp
@@ -541,8 +597,8 @@ class Journal:
                 "2. Common failure patterns and pitfalls to avoid\n"
                 "3. Specific recommendations for future experiments based on both successes and failures"
             ),
-            model=model_kwargs.get("model", "gpt-4o"),
-            temperature=model_kwargs.get("temp", 0.3)
+            model=model_kwargs.get("model", DEFAULT_TREESEARCH_TEXT_MODEL),
+            temperature=model_kwargs.get("temp", DEFAULT_TREESEARCH_TEXT_TEMP)
         )
 
         return summary
@@ -591,21 +647,31 @@ class Journal:
         summary_prompt = {
             "Introduction": "Synthesize the experimental findings from this stage",
             "Node Summaries": node_summaries,
-            "Best Node": (
-                {
-                    "id": self.get_best_node().id,
-                    "metric": str(self.get_best_node(cfg=cfg).metric),
-                }
-                if self.get_best_node(cfg=cfg)
-                else None
-            ),
+            "Best Node": None,
         }
+
+        best_node = self.get_best_node(
+            cfg=cfg, candidate_strategy=candidate_strategy_for_stage_name(stage_name)
+        )
+        if best_node is not None:
+            summary_prompt["Best Node"] = {
+                "id": best_node.id,
+                "metric": str(best_node.metric),
+            }
 
         stage_summary = query(
             system_message=summary_prompt,
             user_message="Generate a comprehensive summary of the experimental findings in this stage",
-            model=cfg.agent.summary.model if cfg.agent.get("summary", None) else "gpt-4o",
-            temperature=cfg.agent.summary.temp if cfg.agent.get("summary", None) else 0.3
+            model=(
+                cfg.agent.summary.model
+                if cfg.agent.get("summary", None)
+                else DEFAULT_TREESEARCH_TEXT_MODEL
+            ),
+            temperature=(
+                cfg.agent.summary.temp
+                if cfg.agent.get("summary", None)
+                else DEFAULT_TREESEARCH_TEXT_TEMP
+            )
         )
 
         with open(os.path.join(notes_dir, f"{stage_name}_summary.txt"), "w") as f:

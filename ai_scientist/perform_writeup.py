@@ -20,6 +20,10 @@ from ai_scientist.tools.semantic_scholar import search_for_papers
 
 from ai_scientist.perform_vlm_review import generate_vlm_img_review
 from ai_scientist.vlm import create_client as create_vlm_client
+from ai_scientist.perform_icbinb_writeup import (
+    _empty_summary_for_stage,
+    _normalize_loaded_summary,
+)
 
 
 def remove_accents_and_clean(s):
@@ -166,7 +170,7 @@ Reasons to reference papers include:
 7. Suggesting Future Research: Reference studies related to proposed future research directions.
 
 Ensure sufficient cites will be collected for all of these categories, and no categories are missed.
-You will be given access to the Semantic Scholar API; only add citations that you have found using the API.
+You will be given access to a Semantic Scholar search tool; only add citations that you have found using that tool.
 Aim to discuss a broad range of relevant papers, not just the most popular ones.
 Make sure not to copy verbatim from prior literature to avoid plagiarism.
 You will have {total_rounds} rounds to add to the references but do not need to use them all.
@@ -270,11 +274,14 @@ This JSON will be automatically parsed, so ensure the format is precise."""
 
     paper_strings = []
     for i, paper in enumerate(papers):
+        authors = ", ".join(
+            author.get("name", "Unknown") for author in paper.get("authors", [])
+        )
         paper_strings.append(
             "{i}: {title}. {authors}. {venue}, {year}.\nAbstract: {abstract}".format(
                 i=i,
                 title=paper["title"],
-                authors=paper["authors"],
+                authors=authors,
                 venue=paper["venue"],
                 year=paper["year"],
                 abstract=paper["abstract"],
@@ -496,14 +503,16 @@ def perform_writeup(
             if osp.exists(path):
                 try:
                     with open(path, "r") as f:
-                        loaded_summaries[key] = json.load(f)
+                        loaded_summaries[key] = _normalize_loaded_summary(
+                            json.load(f), stage_name=key
+                        )
                 except json.JSONDecodeError:
                     print(
                         f"Warning: {fname} is not valid JSON. Using empty data for {key}."
                     )
-                    loaded_summaries[key] = {}
+                    loaded_summaries[key] = _empty_summary_for_stage(key)
             else:
-                loaded_summaries[key] = {}
+                loaded_summaries[key] = _empty_summary_for_stage(key)
 
         # Convert them to one big JSON string for context
         combined_summaries_str = json.dumps(loaded_summaries, indent=2)

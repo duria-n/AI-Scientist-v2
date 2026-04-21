@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 from igraph import Graph
-from ..journal import Journal
+from ..journal import Journal, candidate_strategy_for_stage_name
 
 from rich import print
 
@@ -73,7 +73,9 @@ def get_completed_stages(log_dir):
     return completed_stages
 
 
-def cfg_to_tree_struct(cfg, jou: Journal, out_path: Path = None):
+def cfg_to_tree_struct(
+    cfg, jou: Journal, out_path: Path = None, stage_name: str | None = None
+):
     edges = list(get_edges(jou))
     print(f"[red]Edges: {edges}[/red]")
     try:
@@ -87,7 +89,9 @@ def cfg_to_tree_struct(cfg, jou: Journal, out_path: Path = None):
         print(f"Error in normalize_layout: {e}")
         raise
 
-    best_node = jou.get_best_node(cfg=cfg)
+    best_node = jou.get_best_node(
+        cfg=cfg, candidate_strategy=candidate_strategy_for_stage_name(stage_name)
+    )
     metrics = []
     is_best_node = []
 
@@ -373,10 +377,10 @@ def generate_html(tree_graph_str: str):
         return html
 
 
-def generate(cfg, jou: Journal, out_path: Path):
+def generate(cfg, jou: Journal, out_path: Path, stage_name: str | None = None):
     print("[red]Checking Journal[/red]")
     try:
-        tree_struct = cfg_to_tree_struct(cfg, jou, out_path)
+        tree_struct = cfg_to_tree_struct(cfg, jou, out_path, stage_name=stage_name)
     except Exception as e:
         print(f"Error in cfg_to_tree_struct: {e}")
         raise

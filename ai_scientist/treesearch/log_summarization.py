@@ -1,13 +1,24 @@
 import json
 import os
 import sys
+from collections import defaultdict
 
-from .journal import Node, Journal
+from .journal import (
+    Node,
+    Journal,
+    candidate_strategy_for_stage_name,
+    candidate_strategy_for_stage_number,
+)
+from .utils.config import load_task_desc
 
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 sys.path.insert(0, parent_dir)
 from ai_scientist.llm import get_response_from_llm, extract_json_between_markers
 from ai_scientist.treesearch.backend import get_ai_client
+
+
+DEFAULT_SUMMARY_MODEL = "deepseek-chat"
+STAGE_SUMMARY_ORDER = (1, 2, 3, 4)
 
 
 report_summarizer_sys_msg = """You are an expert machine learning researcher.
@@ -52,11 +63,14 @@ report_summarizer_prompt = (
 
 One key point is that these nodes collectively illustrate a stage of testing different methods or approaches. The crucial task is to identify the scientific insights gleaned from this stage. For example, if one node tries method A and another node tries method B, you should compare any observed differences in performance or outcomes. Summarize both experiments in "Experiment_description", explain the processes in "Description", and place any key numerical findings (such as accuracy metrics, loss values, or runtime comparisons) in "Key_numerical_results."
 
-Be concise and avoid repeating the same information from different nodes. You are encouraged to be thorough, but you do not need to include information from every node. Reason carefully about which results from which nodes are scientifically insightful.
+    Be concise and avoid repeating the same information from different nodes. You are encouraged to be thorough, but you do not need to include information from every node. Reason carefully about which results from which nodes are scientifically insightful.
 
-The name of this stage of the experiment: {stage_name}
+    The name of this stage of the experiment: {stage_name}
 
-Here are the experiment logs of the nodes:
+    Research idea context:
+    {research_context}
+
+    Here are the experiment logs of the nodes:
 
 {node_infos}
 """
@@ -135,19 +149,43 @@ def get_nodes_infos(nodes):
     return node_infos
 
 
-def get_summarizer_prompt(journal, stage_name):
-    good_leaf_nodes = [n for n in journal.good_nodes if n.is_leaf]
+def _get_research_context(cfg) -> str:
+    if cfg is None:
+        return "Title: Not available\nShort Hypothesis: Not available"
+    try:
+        task_desc = json.loads(load_task_desc(cfg))
+    except Exception:
+        return "Title: Not available\nShort Hypothesis: Not available"
+
+    title = task_desc.get("Title", "Not available")
+    short_hypothesis = task_desc.get("Short Hypothesis", "Not available")
+    return f"Title: {title}\nShort Hypothesis: {short_hypothesis}"
+
+
+def get_summarizer_prompt(journal, stage_name, research_context=""):
+    candidate_strategy = candidate_strategy_for_stage_name(stage_name)
+    good_leaf_nodes = [
+        n for n in journal.nodes_for_candidate_strategy(candidate_strategy) if n.is_leaf
+    ]
     if not good_leaf_nodes:
         print("NO GOOD LEAF NODES!!!")
-        good_leaf_nodes = [n for n in journal.good_nodes]
+        good_leaf_nodes = journal.nodes_for_candidate_strategy(candidate_strategy)
+    if not good_leaf_nodes:
+        return None, None
     node_infos = get_nodes_infos(good_leaf_nodes)
     return report_summarizer_sys_msg, report_summarizer_prompt.format(
-        node_infos=node_infos, stage_name=stage_name
+        node_infos=node_infos,
+        stage_name=stage_name,
+        research_context=research_context or "Title: Not available\nShort Hypothesis: Not available",
     )
 
 
-def get_stage_summary(journal, stage_name, model, client):
-    sys_msg, prompt = get_summarizer_prompt(journal, stage_name)
+def get_stage_summary(journal, stage_name, model, client, research_context=""):
+    sys_msg, prompt = get_summarizer_prompt(
+        journal, stage_name, research_context=research_context
+    )
+    if not sys_msg or not prompt:
+        return None
     response = get_response_from_llm(prompt, client, model, sys_msg)
     summary_json = extract_json_between_markers(response[0])
     return summary_json
@@ -266,10 +304,10 @@ def annotate_history(journal, cfg=None):
             retry_count = 0
             while retry_count < max_retries:
                 try:
-                    if cfg.agent.get("summary", None) is not None:
+                    if cfg and cfg.agent.get("summary", None) is not None:
                         model = cfg.agent.summary.model
                     else:
-                        model = "gpt-4o-2024-08-06"
+                        model = DEFAULT_SUMMARY_MODEL
                     client = get_ai_client(model)
                     response = get_response_from_llm(
                         overall_plan_summarizer_prompt.format(
@@ -296,14 +334,65 @@ def annotate_history(journal, cfg=None):
             node.overall_plan = node.plan
 
 
+def _get_summary_model(cfg):
+    if cfg and cfg.agent.get("summary", None) is not None:
+        return cfg.agent.summary.get("model", DEFAULT_SUMMARY_MODEL)
+    return DEFAULT_SUMMARY_MODEL
+
+
+def _parse_main_stage_number(stage_name):
+    try:
+        return int(str(stage_name).split("_", 1)[0])
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def _merge_stage_journals(stage_entries):
+    merged_nodes = []
+    seen_node_ids = set()
+
+    for _, journal in stage_entries:
+        for node in journal.nodes:
+            if node.id in seen_node_ids:
+                continue
+            merged_nodes.append(node)
+            seen_node_ids.add(node.id)
+
+    return Journal(nodes=merged_nodes)
+
+
 def overall_summarize(journals, cfg=None):
     from concurrent.futures import ThreadPoolExecutor
 
-    def process_stage(idx, stage_tuple):
-        stage_name, journal = stage_tuple
-        annotate_history(journal, cfg=cfg)
-        if idx in [1, 2]:
-            best_node = journal.get_best_node(cfg=cfg)
+    journals = list(journals)
+    grouped_stage_entries = defaultdict(list)
+    for stage_name, journal in journals:
+        main_stage_number = _parse_main_stage_number(stage_name)
+        if main_stage_number in STAGE_SUMMARY_ORDER:
+            grouped_stage_entries[main_stage_number].append((stage_name, journal))
+        else:
+            print(f"Skipping unrecognized stage name during summarization: {stage_name}")
+
+    research_context = _get_research_context(cfg)
+
+    def process_stage(stage_number):
+        stage_entries = grouped_stage_entries.get(stage_number, [])
+        if not stage_entries:
+            return stage_number, None
+
+        for _, journal in stage_entries:
+            annotate_history(journal, cfg=cfg)
+
+        stage_name = stage_entries[-1][0]
+        journal = _merge_stage_journals(stage_entries)
+
+        if stage_number in [2, 3]:
+            best_node = journal.get_best_node(
+                cfg=cfg,
+                candidate_strategy=candidate_strategy_for_stage_number(stage_number),
+            )
+            if best_node is None:
+                return stage_number, None
             # get multi-seed results and aggregater node
             child_nodes = best_node.children
             multi_seed_nodes = [
@@ -316,14 +405,14 @@ def overall_summarize(journals, cfg=None):
                     break
             if agg_node is None:
                 # skip agg node
-                return {
+                return stage_number, {
                     "best node": get_node_log(best_node),
                     "best node with different seeds": [
                         get_node_log(n) for n in multi_seed_nodes
                     ],
                 }
             else:
-                return {
+                return stage_number, {
                     "best node": get_node_log(best_node),
                     "best node with different seeds": [
                         get_node_log(n) for n in multi_seed_nodes
@@ -332,33 +421,55 @@ def overall_summarize(journals, cfg=None):
                         agg_node
                     ),
                 }
-        elif idx == 3:
+        elif stage_number == 4:
             good_leaf_nodes = [
-                n for n in journal.good_nodes if n.is_leaf and n.ablation_name
+                n
+                for n in journal.nodes_for_candidate_strategy(
+                    candidate_strategy_for_stage_number(stage_number)
+                )
+                if n.is_leaf and n.ablation_name
             ]
-            return [get_node_log(n) for n in good_leaf_nodes]
-        elif idx == 0:
-            if cfg.agent.get("summary", None) is not None:
-                model = cfg.agent.summary.get("model", "")
-            else:
-                model = "gpt-4o-2024-08-06"
+            return stage_number, [get_node_log(n) for n in good_leaf_nodes]
+        elif stage_number == 1:
+            model = _get_summary_model(cfg)
             client = get_ai_client(model)
-            summary_json = get_stage_summary(journal, stage_name, model, client)
-            return summary_json
+            summary_json = get_stage_summary(
+                journal,
+                stage_name,
+                model,
+                client,
+                research_context=research_context,
+            )
+            return stage_number, summary_json
+
+        return stage_number, None
 
     from tqdm import tqdm
+
+    stage_summaries = {stage_number: None for stage_number in STAGE_SUMMARY_ORDER}
+    present_stage_numbers = [
+        stage_number
+        for stage_number in STAGE_SUMMARY_ORDER
+        if grouped_stage_entries.get(stage_number)
+    ]
 
     with ThreadPoolExecutor() as executor:
         results = list(
             tqdm(
-                executor.map(process_stage, range(len(list(journals))), journals),
+                executor.map(process_stage, present_stage_numbers),
                 desc="Processing stages",
-                total=len(list(journals)),
+                total=len(present_stage_numbers),
             )
         )
-        draft_summary, baseline_summary, research_summary, ablation_summary = results
+        for stage_number, summary in results:
+            stage_summaries[stage_number] = summary
 
-    return draft_summary, baseline_summary, research_summary, ablation_summary
+    return (
+        stage_summaries[1],
+        stage_summaries[2],
+        stage_summaries[3],
+        stage_summaries[4],
+    )
 
 
 if __name__ == "__main__":

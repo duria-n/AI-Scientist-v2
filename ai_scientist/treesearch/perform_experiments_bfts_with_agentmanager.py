@@ -4,7 +4,7 @@ import shutil
 import json
 import pickle
 from . import backend
-from .journal import Journal, Node
+from .journal import Journal, Node, candidate_strategy_for_stage_name
 from .journal2report import journal2report
 from rich.columns import Columns
 from rich.console import Group
@@ -21,6 +21,7 @@ from rich.progress import (
 from rich.text import Text
 from rich.status import Status
 from rich.tree import Tree
+from rich.markup import escape
 from .utils.config import load_task_desc, prep_agent_workspace, save_run, load_cfg
 from .agent_manager import AgentManager
 from pathlib import Path
@@ -31,8 +32,14 @@ from .log_summarization import overall_summarize
 logger = logging.getLogger("ai-scientist")
 
 
-def journal_to_rich_tree(journal: Journal, cfg):
-    best_node = journal.get_best_node(cfg=cfg)
+def journal_to_rich_tree(journal: Journal, cfg, stage_name: str | None = None):
+    best_node = journal.get_best_node(
+        cfg=cfg, candidate_strategy=candidate_strategy_for_stage_name(stage_name)
+    )
+
+    def metric_label(node: Node) -> str:
+        raw_label = str(node.metric) if node.metric is not None else "Metric(?)"
+        return escape(raw_label)
 
     def append_rec(node: Node, tree):
         if node.is_buggy:
@@ -41,9 +48,9 @@ def journal_to_rich_tree(journal: Journal, cfg):
             style = "bold " if node is best_node else ""
 
             if node is best_node:
-                s = f"[{style}green]● {node.metric.value:.3f} (best)"
+                s = f"[{style}green]● {metric_label(node)} (best)"
             else:
-                s = f"[{style}green]● {node.metric.value:.3f}"
+                s = f"[{style}green]● {metric_label(node)}"
 
         subtree = tree.add(s)
         for child in node.children:
@@ -129,7 +136,10 @@ def perform_experiments_bfts(config_path: str):
             else:
                 current_findings = journal.generate_summary(include_code=False)
 
-            best_metric = journal.get_best_node(cfg=cfg)
+            best_metric = journal.get_best_node(
+                cfg=cfg,
+                candidate_strategy=candidate_strategy_for_stage_name(stage.name),
+            )
 
             # Generate and save stage progress summary
             stage_summary = {
@@ -165,7 +175,7 @@ def perform_experiments_bfts(config_path: str):
         )
 
         if current_journal:
-            tree = journal_to_rich_tree(current_journal, cfg)
+            tree = journal_to_rich_tree(current_journal, cfg, current_stage.name)
         else:
             tree = Tree("[bold blue]No results yet")
 

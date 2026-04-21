@@ -1,31 +1,14 @@
-import os.path as osp
-import json
 import argparse
-import shutil
-import torch
+import json
 import os
+import os.path as osp
 import re
+import shutil
 import sys
-from datetime import datetime
-from ai_scientist.llm import create_client
-
 from contextlib import contextmanager
-from ai_scientist.treesearch.perform_experiments_bfts_with_agentmanager import (
-    perform_experiments_bfts,
-)
-from ai_scientist.treesearch.bfts_utils import (
-    idea_to_markdown,
-    edit_bfts_config_file,
-)
-from ai_scientist.perform_plotting import aggregate_plots
-from ai_scientist.perform_writeup import perform_writeup
-from ai_scientist.perform_icbinb_writeup import (
-    perform_writeup as perform_icbinb_writeup,
-    gather_citations,
-)
-from ai_scientist.perform_llm_review import perform_review, load_paper
-from ai_scientist.perform_vlm_review import perform_imgs_cap_ref_review
-from ai_scientist.utils.token_tracker import token_tracker
+from datetime import datetime
+
+from ai_scientist.utils.env_check import validate_runtime_environment
 
 
 def print_time():
@@ -33,6 +16,8 @@ def print_time():
 
 
 def save_token_tracker(idea_dir):
+    from ai_scientist.utils.token_tracker import token_tracker
+
     with open(osp.join(idea_dir, "token_tracker.json"), "w") as f:
         json.dump(token_tracker.get_summary(), f)
     with open(osp.join(idea_dir, "token_tracker_interactions.json"), "w") as f:
@@ -132,6 +117,8 @@ def parse_arguments():
 
 
 def get_available_gpus(gpu_ids=None):
+    import torch
+
     if gpu_ids is not None:
         return [int(gpu_id) for gpu_id in gpu_ids.split(",")]
     return list(range(torch.cuda.device_count()))
@@ -181,6 +168,32 @@ def redirect_stdout_stderr_to_file(log_file_path):
 
 if __name__ == "__main__":
     args = parse_arguments()
+    try:
+        validate_runtime_environment(
+            env_name="ai_scientist",
+            repo_root=osp.dirname(osp.abspath(__file__)),
+        )
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(1)
+
+    from ai_scientist.llm import create_client
+    from ai_scientist.perform_icbinb_writeup import (
+        gather_citations,
+        perform_writeup as perform_icbinb_writeup,
+    )
+    from ai_scientist.perform_llm_review import load_paper, perform_review
+    from ai_scientist.perform_plotting import aggregate_plots
+    from ai_scientist.perform_vlm_review import perform_imgs_cap_ref_review
+    from ai_scientist.perform_writeup import perform_writeup
+    from ai_scientist.treesearch.bfts_utils import (
+        edit_bfts_config_file,
+        idea_to_markdown,
+    )
+    from ai_scientist.treesearch.perform_experiments_bfts_with_agentmanager import (
+        perform_experiments_bfts,
+    )
+
     os.environ["AI_SCIENTIST_ROOT"] = os.path.dirname(os.path.abspath(__file__))
     print(f"Set AI_SCIENTIST_ROOT to {os.environ['AI_SCIENTIST_ROOT']}")
 
@@ -319,44 +332,50 @@ if __name__ == "__main__":
             print("Paper review completed.")
 
     print("Start cleaning up processes")
-    # Kill all mp and torch processes associated with this experiment
-    import psutil
-    import signal
+    try:
+        import psutil
+        import signal
 
-    # Get the current process and all its children
-    current_process = psutil.Process()
-    children = current_process.children(recursive=True)
+        # Get the current process and all its children
+        current_process = psutil.Process()
+        children = current_process.children(recursive=True)
 
-    # First try graceful termination
-    for child in children:
-        try:
-            child.send_signal(signal.SIGTERM)
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
+        # First try graceful termination
+        for child in children:
+            try:
+                child.send_signal(signal.SIGTERM)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
 
-    # Wait briefly for processes to terminate
-    gone, alive = psutil.wait_procs(children, timeout=3)
+        # Wait briefly for processes to terminate
+        _, alive = psutil.wait_procs(children, timeout=3)
 
-    # If any processes remain, force kill them
-    for process in alive:
-        try:
-            process.kill()
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
+        # If any processes remain, force kill them
+        for process in alive:
+            try:
+                process.kill()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
 
-    # Additional cleanup: find any orphaned processes containing specific keywords
-    keywords = ["python", "torch", "mp", "bfts", "experiment"]
-    for proc in psutil.process_iter(["name", "cmdline"]):
-        try:
-            # Check both process name and command line arguments
-            cmdline = " ".join(proc.cmdline()).lower()
-            if any(keyword in cmdline for keyword in keywords):
-                proc.send_signal(signal.SIGTERM)
-                proc.wait(timeout=3)
-                if proc.is_running():
-                    proc.kill()
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired):
-            continue
+        # Additional cleanup: find any orphaned processes containing specific keywords
+        keywords = ["python", "torch", "mp", "bfts", "experiment"]
+        for proc in psutil.process_iter(["name", "cmdline"]):
+            try:
+                # Check both process name and command line arguments
+                cmdline = " ".join(proc.cmdline()).lower()
+                if any(keyword in cmdline for keyword in keywords):
+                    proc.send_signal(signal.SIGTERM)
+                    proc.wait(timeout=3)
+                    if proc.is_running():
+                        proc.kill()
+            except (
+                psutil.NoSuchProcess,
+                psutil.AccessDenied,
+                psutil.TimeoutExpired,
+            ):
+                continue
+    except ImportError:
+        print("Skipping aggressive process cleanup because psutil is not installed.")
 
     # Finally, terminate the current process
     # current_process.send_signal(signal.SIGTERM)

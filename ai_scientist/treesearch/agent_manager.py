@@ -5,7 +5,7 @@ from enum import Enum, auto
 from pathlib import Path
 import logging
 from .parallel_agent import ParallelAgent
-from .journal import Journal, Node
+from .journal import Journal, Node, candidate_strategy_for_stage_name
 import copy
 import re
 from .backend import query, FunctionSpec
@@ -344,7 +344,10 @@ Your research idea:\n\n
         self, current_substage: Stage, journal: Journal
     ) -> bool:
         """Check if the current sub-stage is complete"""
-        best_node = journal.get_best_node(cfg=self.cfg)
+        best_node = journal.get_best_node(
+            cfg=self.cfg,
+            candidate_strategy=candidate_strategy_for_stage_name(current_substage.name),
+        )
         if not best_node:
             return False, "No best node found"
 
@@ -442,7 +445,10 @@ Your research idea:\n\n
                 return True, "Found working implementation"
 
         if stage.stage_number == 2:
-            best_node = journal.get_best_node(cfg=self.cfg)
+            best_node = journal.get_best_node(
+                cfg=self.cfg,
+                candidate_strategy=candidate_strategy_for_stage_name(stage.name),
+            )
             if not best_node:
                 return False, "No best node found"
             if best_node == journal.nodes[0]:
@@ -498,7 +504,10 @@ Your research idea:\n\n
                 return False, "Error in stage 2 completion evaluation"
 
         if stage.stage_number == 3:
-            best_node = journal.get_best_node(cfg=self.cfg)
+            best_node = journal.get_best_node(
+                cfg=self.cfg,
+                candidate_strategy=candidate_strategy_for_stage_name(stage.name),
+            )
             if not best_node:
                 return False, "No best node found"
             if best_node == journal.nodes[0]:
@@ -539,7 +548,10 @@ Your research idea:\n\n
         """Get the best implementation from a completed stage"""
         if stage_name not in self.journals:
             return None
-        best_node = self.journals[stage_name].get_best_node(cfg=self.cfg)
+        best_node = self.journals[stage_name].get_best_node(
+            cfg=self.cfg,
+            candidate_strategy=candidate_strategy_for_stage_name(stage_name),
+        )
         if best_node:
             # Create a clean copy of the node for the next stage
             copied_node = copy.deepcopy(best_node)
@@ -1056,11 +1068,15 @@ Your research idea:\n\n
                 metrics["node_summaries"].append(node_summary)
 
         # Get VLM feedback from plot analysis
-        for node in journal.good_nodes:
+        for node in journal.plot_validated_good_nodes:
             if hasattr(node, "_vlm_feedback"):
                 metrics["vlm_feedback"].append(node._vlm_feedback)
 
-        best_node = journal.get_best_node(cfg=self.cfg)
+        stage_name = self.current_stage.name if self.current_stage else None
+        best_node = journal.get_best_node(
+            cfg=self.cfg,
+            candidate_strategy=candidate_strategy_for_stage_name(stage_name),
+        )
         if best_node:
             metrics["best_metric"] = {
                 "value": best_node.metric.value,
@@ -1105,7 +1121,7 @@ Your research idea:\n\n
 
         # Include VLM-identified systemic issues
         vlm_issues = set()  # Use set to avoid duplicate issues
-        for node in journal.good_nodes:
+        for node in journal.plot_validated_good_nodes:
             if hasattr(node, "_vlm_feedback"):
                 vlm_feedback = node._vlm_feedback
                 if isinstance(vlm_feedback, dict):

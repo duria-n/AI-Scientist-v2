@@ -8,11 +8,11 @@ import logging
 import humanize
 from .backend import FunctionSpec, compile_prompt_to_md, query
 from .interpreter import ExecutionResult
-from .journal import Journal, Node
+from .journal import Journal, Node, candidate_strategy_for_stage_name
 from .utils import data_preview
 from .utils.config import Config
-from .utils.metric import MetricValue, WorstMetricValue
-from .utils.response import extract_code, extract_text_up_to_code, wrap_code
+from .utils.metric import MetricValue, WorstMetricValue, validate_metric_value
+from .utils.response import extract_code, wrap_code
 import copy
 import pickle
 from dataclasses import asdict
@@ -26,6 +26,10 @@ import sys
 logger = logging.getLogger("ai-scientist")
 
 ExecCallbackType = Callable[[str, bool], ExecutionResult]
+CODE_GENERATION_FAILURE_MESSAGE = "LLM code extraction failed"
+CODE_GENERATION_FAILURE_SCRIPT = (
+    f'raise RuntimeError("{CODE_GENERATION_FAILURE_MESSAGE}")\n'
+)
 
 
 def _safe_pickle_test(obj, name="object"):
@@ -36,6 +40,108 @@ def _safe_pickle_test(obj, name="object"):
     except Exception as e:
         logger.error(f"Cannot pickle {name}: {str(e)}")
         return False
+
+
+def _code_only_response_format() -> str:
+    return (
+        "Return only a single markdown code block in the format ```python ... ```. "
+        "Do not include any natural-language explanation, headings, bullets, or text before or after the code block."
+    )
+
+
+def _plan_only_response_format() -> str:
+    return (
+        "Return only a concise natural-language implementation plan in 3-6 sentences. "
+        "Do not include code, markdown code fences, headings, bullets, or backticks."
+    )
+
+
+def _with_response_format(prompt: dict, response_format: str) -> dict:
+    prompt_copy = copy.deepcopy(prompt)
+    instructions = prompt_copy.get("Instructions")
+    if isinstance(instructions, dict):
+        instructions["Response format"] = response_format
+    else:
+        prompt_copy["Response format"] = response_format
+    return prompt_copy
+
+
+def _with_parsing_feedback(prompt: dict, feedback: str) -> dict:
+    prompt_copy = copy.deepcopy(prompt)
+    prompt_copy["Parsing Feedback"] = feedback
+    return prompt_copy
+
+
+def _run_plan_query(prompt: dict, model: str, temperature: float, retries: int = 3) -> str:
+    completion_text = ""
+    for _ in range(retries):
+        completion_text = query(
+            system_message=_with_response_format(prompt, _plan_only_response_format()),
+            user_message=None,
+            model=model,
+            temperature=temperature,
+        )
+        stripped = completion_text.strip()
+        if stripped and "```" not in stripped:
+            return stripped
+        print("Plan extraction failed, retrying...")
+        prompt = _with_parsing_feedback(
+            prompt,
+            "Plan extraction failed. Return only plain natural-language plan text with no code fences or markdown.",
+        )
+
+    print("Final plan extraction attempt failed, falling back to placeholder plan...")
+    return "Plan extraction failed; proceeding with direct code generation."
+
+
+def _run_code_query(
+    prompt: dict,
+    model: str,
+    temperature: float,
+    plan: str = "",
+    retries: int = 3,
+) -> str:
+    completion_text = ""
+    for _ in range(retries):
+        query_prompt = _with_response_format(prompt, _code_only_response_format())
+        if plan:
+            query_prompt["Approved implementation plan"] = plan
+        completion_text = query(
+            system_message=query_prompt,
+            user_message=None,
+            model=model,
+            temperature=temperature,
+        )
+        code = extract_code(completion_text)
+        if code:
+            return code
+
+        print("Code extraction failed, retrying...")
+        prompt = _with_parsing_feedback(
+            prompt,
+            "Code extraction failed. Return only a single fenced python code block with no surrounding explanation.",
+        )
+
+    print("Final code extraction attempt failed, using deterministic failure script...")
+    return CODE_GENERATION_FAILURE_SCRIPT
+
+
+def _apply_metric_validation(node: Node) -> None:
+    if node.metric is None or isinstance(node.metric, WorstMetricValue):
+        return
+
+    validation_errors = validate_metric_value(node.metric)
+    if not validation_errors:
+        return
+
+    validation_summary = "Invalid parsed metrics: " + " ".join(validation_errors)
+    node.metric = WorstMetricValue()
+    node.is_buggy = True
+    node.analysis = (
+        f"{node.analysis}\n\n{validation_summary}".strip()
+        if node.analysis
+        else validation_summary
+    )
 
 
 def _parse_keyword_prefix_response(
@@ -395,60 +501,22 @@ class MinimalAgent:
 
     @property
     def _prompt_resp_fmt(self):
-        return {
-            "Response format": (
-                "Your response should be a brief outline/sketch of your proposed solution in natural language (7-10 sentences), "
-                "followed by a single markdown code block (using the format ```python ... ```) which implements this solution and prints out the evaluation metric(s) if applicable. "
-                "There should be no additional headings or text in your response. Just natural language text followed by a newline and then the markdown code block. "
-                "Make sure to write concise code."
-            )
-        }
+        return {"Response format": _code_only_response_format()}
 
     def _prompt_metricparse_resp_fmt(self):
-        return {
-            "Response format": (
-                "Your response should be a brief outline/sketch of your proposed solution in natural language (3-5 sentences), "
-                "followed by a single markdown code block (using the format ```python ... ```) which implements the full code for the metric parsing. "
-                "There should be no additional headings or text in your response. Just natural language text followed by a newline and then the markdown code block. "
-                "Your generated code should be complete and executable. "
-            )
-        }
+        return _code_only_response_format()
 
     @property
     def _prompt_debug_resp_fmt(self):
-        return {
-            "Response format": (
-                "Your response should be a brief outline/sketch of your proposed solution in natural language (3-5 sentences), "
-                "followed by a single markdown code block (using the format ```python ... ```) which implements the full code including the bugfix/solution. "
-                "There should be no additional headings or text in your response. Just natural language text followed by a newline and then the markdown code block. "
-                "Your generated code should be complete and executable. Do not omit any part of the code, even if it was part of a previous implementation."
-                "Make sure to write concise code."
-            )
-        }
+        return {"Response format": _code_only_response_format()}
 
     @property
     def _prompt_hyperparam_tuning_resp_fmt(self):
-        return {
-            "Response format": (
-                "Your response should be a brief outline/sketch of your proposed solution in natural language (3-5 sentences), "
-                "followed by a single markdown code block (using the format ```python ... ```) which implements the full code including hyperparameter tuning. "
-                "There should be no additional headings or text in your response. Do not omit any part of the code, "
-                "Your generated code should be complete and executable."
-                "Make sure to write concise code."
-            )
-        }
+        return {"Response format": _code_only_response_format()}
 
     @property
     def _prompt_ablation_resp_fmt(self):
-        return {
-            "Response format": (
-                "Your response should be a brief outline/sketch of your proposed solution in natural language (3-5 sentences), "
-                "followed by a single markdown code block (using the format ```python ... ```) which implements the full code including the ablation study. "
-                "There should be no additional headings or text in your response. Do not omit any part of the code, "
-                "Your generated code should be complete and executable."
-                "Make sure to write concise code."
-            )
-        }
+        return {"Response format": _code_only_response_format()}
 
     def _draft(self) -> Node:
         prompt: Any = {
@@ -494,9 +562,8 @@ class MinimalAgent:
     def _debug(self, parent_node: Node) -> Node:
         prompt: Any = {
             "Introduction": (
-                "You are an experienced AI researcher. Your previous code for research experiment had a bug, so based on the information below, you should revise it in order to fix this bug. "
-                "Your response should be an implementation outline in natural language,"
-                " followed by a single markdown code block which implements the bugfix/solution."
+                "You are an experienced AI researcher. Your previous code for the research experiment had a bug, "
+                "so you should revise it to fix the issue while preserving the intended experiment."
             ),
             "Research idea": self.task_desc,
             "Previous (buggy) implementation": wrap_code(parent_node.code),
@@ -655,30 +722,24 @@ class MinimalAgent:
             ablation_name=ablation_idea.name,
         )
 
+    def plan_query(self, prompt, retries=3) -> str:
+        return _run_plan_query(
+            prompt, self.cfg.agent.code.model, self.cfg.agent.code.temp, retries=retries
+        )
+
+    def code_query(self, prompt, plan="", retries=3) -> str:
+        return _run_code_query(
+            prompt,
+            self.cfg.agent.code.model,
+            self.cfg.agent.code.temp,
+            plan=plan,
+            retries=retries,
+        )
+
     def plan_and_code_query(self, prompt, retries=3) -> tuple[str, str]:
-        """Generate a natural language plan + code in the same LLM call and split them apart."""
-        completion_text = None
-        for _ in range(retries):
-            completion_text = query(
-                system_message=prompt,
-                user_message=None,
-                model=self.cfg.agent.code.model,
-                temperature=self.cfg.agent.code.temp,
-            )
-
-            code = extract_code(completion_text)
-            nl_text = extract_text_up_to_code(completion_text)
-
-            if code and nl_text:
-                # merge all code blocks into a single string
-                return nl_text, code
-
-            print("Plan + code extraction failed, retrying...")
-            prompt["Parsing Feedback"] = (
-                "The code extraction failed. Make sure to use the format ```python ... ``` for the code blocks."
-            )
-        print("Final plan + code extraction attempt failed, giving up...")
-        return "", completion_text  # type: ignore
+        plan = self.plan_query(prompt, retries=retries)
+        code = self.code_query(prompt, plan=plan, retries=retries)
+        return plan, code
 
     def parse_exec_result(
         self, node: Node, exec_result: ExecutionResult, workspace: str
@@ -692,6 +753,7 @@ class MinimalAgent:
                 "You are an experienced AI researcher. "
                 "You have written code for your research experiment and now need to evaluate the output of the code execution. "
                 "Analyze the execution output, determine if there were any bugs, and provide a summary of the findings. "
+                "Treat impossible metric values or logically inconsistent results as bugs, even if the script exited successfully. "
             ),
             "Research idea": self.task_desc,
             "Implementation": wrap_code(node.code),
@@ -1221,29 +1283,24 @@ class ParallelAgent:
         print(f"[green]Defined eval metrics:[/green] {response}")
         return response
 
+    def plan_query(self, prompt, retries=3) -> str:
+        return _run_plan_query(
+            prompt, self.cfg.agent.code.model, self.cfg.agent.code.temp, retries=retries
+        )
+
+    def code_query(self, prompt, plan="", retries=3) -> str:
+        return _run_code_query(
+            prompt,
+            self.cfg.agent.code.model,
+            self.cfg.agent.code.temp,
+            plan=plan,
+            retries=retries,
+        )
+
     def plan_and_code_query(self, prompt, retries=3) -> tuple[str, str]:
-        """Generate a natural language plan + code in the same LLM call and split them apart."""
-        completion_text = None
-        for _ in range(retries):
-            completion_text = query(
-                system_message=prompt,
-                user_message=None,
-                model=self.cfg.agent.code.model,
-                temperature=self.cfg.agent.code.temp,
-            )
-
-            code = extract_code(completion_text)
-            nl_text = extract_text_up_to_code(completion_text)
-
-            if code and nl_text:
-                # merge all code blocks into a single string
-                return nl_text, code
-            print("Plan + code extraction failed, retrying...")
-            prompt["Parsing Feedback"] = (
-                "The code extraction failed. Make sure to use the format ```python ... ``` for the code blocks."
-            )
-        print("Final plan + code extraction attempt failed, giving up...")
-        return "", completion_text
+        plan = self.plan_query(prompt, retries=retries)
+        code = self.code_query(prompt, plan=plan, retries=retries)
+        return plan, code
 
     def _generate_seed_eval_aggregation_node(
         self, node: Node, agg_plotting_code: str
@@ -1635,9 +1692,15 @@ class ParallelAgent:
                             child_node.metric = MetricValue(
                                 value={"metric_names": metrics_response["metric_names"]}
                             )
-                            logger.info(
-                                f"Successfully extracted metrics for node {child_node.id}"
-                            )
+                            _apply_metric_validation(child_node)
+                            if child_node.is_buggy:
+                                logger.error(
+                                    f"Parsed metrics failed validation for node {child_node.id}"
+                                )
+                            else:
+                                logger.info(
+                                    f"Successfully extracted metrics for node {child_node.id}"
+                                )
                         else:
                             child_node.metric = WorstMetricValue()
                             child_node.is_buggy = True
@@ -2016,13 +2079,16 @@ class ParallelAgent:
             else:  # Stage 1, 3 (normal best-first search)
                 # Improvement phase
                 print("Checking good nodes..")
-                good_nodes = self.journal.good_nodes
+                candidate_strategy = candidate_strategy_for_stage_name(self.stage_name)
+                good_nodes = self.journal.nodes_for_candidate_strategy(candidate_strategy)
                 if not good_nodes:
                     nodes_to_process.append(None)  # Back to drafting
                     continue
 
                 # Get best node from unprocessed tree if possible
-                best_node = self.journal.get_best_node(cfg=self.cfg)
+                best_node = self.journal.get_best_node(
+                    cfg=self.cfg, candidate_strategy=candidate_strategy
+                )
                 tree_root = best_node
                 while tree_root.parent:
                     tree_root = tree_root.parent
@@ -2302,11 +2368,7 @@ class ParallelAgent:
             "Instructions": {},
         }
         plotting_prompt["Instructions"] |= {
-            "Response format": (
-                "Your response should be a brief outline/sketch of your proposed solution in natural language (7-10 sentences), "
-                "followed by a single markdown code block (wrapped in ```) which implements this solution and prints out the evaluation metric(s) if applicable. "
-                "There should be no additional headings or text in your response. Just natural language text followed by a newline and then the markdown code block. "
-            )
+            "Response format": _code_only_response_format()
         }
         plotting_prompt["Instructions"] |= {
             "Plotting code guideline": prompt_guideline,

@@ -62,12 +62,11 @@ def extract_code(text):
         code_block = match[1]
         parsed_codes.append(code_block)
 
-    # When the entire text is code or backticks of the code block is missing
-    if len(parsed_codes) == 0:
-        matches = re.findall(r"^(```(python)?)?\n?(.*?)\n?(```)?$", text, re.DOTALL)
-        if matches:
-            code_block = matches[0][2]
-            parsed_codes.append(code_block)
+    # Only fall back to treating the entire completion as code if it is already a
+    # syntactically valid Python script. This prevents natural-language prefixes
+    # from being executed as Python after extraction failures.
+    if len(parsed_codes) == 0 and is_valid_python_script(text.strip()):
+        parsed_codes.append(text.strip())
 
     # validate the parsed codes
     valid_code_blocks = [

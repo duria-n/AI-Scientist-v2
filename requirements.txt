@@ -2,13 +2,17 @@
 anthropic
 backoff
 openai
+requests
+charset_normalizer
 # Viz
 matplotlib
+pillow
 pypdf
 pymupdf4llm
 seaborn
 # Common Requirements
 numpy
+pandas
 transformers
 datasets
 tiktoken
@@ -27,3 +31,5 @@ jsonschema
 omegaconf
 botocore
 boto3
+jinja2
+psutil

@@ -6,6 +6,7 @@ import backoff
 import openai
 import os
 from PIL import Image
+from ai_scientist.utils.network import normalize_httpx_proxy_env
 from ai_scientist.utils.token_tracker import track_token_usage
 
 MAX_NUM_TOKENS = 4096
@@ -194,6 +195,7 @@ def get_response_from_vlm(
 
 def create_client(model: str) -> tuple[Any, str]:
     """Create client for vision-language model."""
+    normalize_httpx_proxy_env()
     if model in [
         "gpt-4o-2024-05-13",
         "gpt-4o-2024-08-06",
